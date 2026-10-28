@@ -90,7 +90,9 @@ def main():
 
     symbols = (args.symbols or http(f"http://{args.host}/tickers").decode()).split(",")
     logos = {}
-    for sym in (s.strip().upper() for s in symbols):
+    for sym in (s.split(":")[0].strip().upper() for s in symbols):  # drop ":Label"
+        if not sym:
+            continue
         try:
             logos[sym] = to_logo(http(LOGO_URL.format(urllib.parse.quote(sym))))
         except (urllib.error.URLError, OSError) as e:
