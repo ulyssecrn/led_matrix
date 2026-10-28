@@ -13,6 +13,7 @@
 #include <driver/rtc_io.h>
 #include <esp_sleep.h>
 #include <esp_partition.h>
+#include <esp_task_wdt.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
@@ -128,7 +129,11 @@ const LifeScene lifeScenes[] = {
 // Stock ticker: quotes from Yahoo's chart API over HTTPS (~45 KB RAM for TLS).
 #define MAX_QUOTES 12
 #define QUOTE_REFRESH_MS (5 * 60 * 1000UL)
-struct Quote { char sym[12]; float price, changePct; bool valid; const uint16_t *logo; };
+#define DEFAULT_TICKERS "^GSPC:S&P500,^FCHI:CAC40,AAPL,NVDA,GOOGL,TSM:TSMC,AMZN,META,TSLA,BTC-USD:BTC"
+struct Quote { char sym[12], label[12]; float price, changePct; bool valid; const uint16_t *logo; };
+enum TickerLayout { TICKER_BIG, TICKER_COMPACT, TICKER_CLOCK, TICKER_LAYOUT_COUNT };
+const char *tickerLayoutNames[] = {"2 big rows", "3 compact rows", "2 compact rows + clock"};
+uint8_t tickerLayout;
 
 // Ticker logos: 16x16 RGB565, uploaded by tools/logos.py into the unused "spiffs"
 // flash partition, one sector per logo so replacing one is a single erase.
@@ -255,6 +260,11 @@ void handleRoot() {
              modeNames[i] + "</button> ";
   }
   modes += "</form>";
+  String layoutOptions;
+  for (int i = 0; i < TICKER_LAYOUT_COUNT; i++) {
+    layoutOptions += String("<option value=") + i + (i == tickerLayout ? " selected>" : ">") +
+                     tickerLayoutNames[i] + "</option>";
+  }
   String sceneOptions;
   for (int i = 0; i <= LIFE_CYCLE; i++) {
     sceneOptions += String("<option value=") + i + (i == lifeScene ? " selected>" : ">") +
@@ -290,9 +300,11 @@ void handleRoot() {
     "<label>Speed <small>(left = faster)</small>"
     "<input type=range name=lspeed min=20 max=1000 step=10 value=" + lifeSpeed + "></label>"
     "<h3>Ticker</h3>"
-    "<label>Symbols <small>(comma separated, up to 12, Yahoo style: AAPL, ^GSPC, BTC-USD)</small>"
-    "<input name=tickers maxlength=150 style='width:100%' value=\"" + htmlEscape(tickerSymbols) + "\"></label>"
-    "<label>Bottom half scrolls<select name=topp>"
+    "<label>Symbols <small>(comma separated, up to 12, Yahoo symbols, optional :Label, "
+    "e.g. AAPL, ^GSPC:S&amp;P500, BTC-USD)</small>"
+    "<input name=tickers maxlength=200 value=\"" + htmlEscape(tickerSymbols) + "\"></label>"
+    "<label>Layout<select name=tlayout>" + layoutOptions + "</select></label>"
+    "<label>Every other row scrolls<select name=topp>"
     "<option value=1" + (tickerOpposite ? " selected" : "") + ">the other way</option>"
     "<option value=0" + (!tickerOpposite ? " selected" : "") + ">the same way</option></select></label>"
     "<p><button>Save</button></form>"
@@ -318,6 +330,15 @@ void handleSet() {
     lifeScene = scene;
   }
   if (server.hasArg("topp")) tickerOpposite = server.arg("topp") == "1";
+  if (server.hasArg("tlayout")) {
+    uint8_t layout = constrain(server.arg("tlayout").toInt(), 0, TICKER_LAYOUT_COUNT - 1);
+    if (layout != tickerLayout && mode == MODE_TICKER) {
+      display->clearScreen();
+      forceRedraw = true;
+    }
+    tickerLayout = layout;
+  }
+  prefs.putUChar("tlayout", tickerLayout);
   if (server.hasArg("tickers") && server.arg("tickers") != tickerSymbols) {
     tickerSymbols = server.arg("tickers");
     parseSymbols();
@@ -408,6 +429,7 @@ void setupWeb() {
   }, []() {
     if (!server.authenticate("admin", OTA_PASSWORD)) return;
     HTTPUpload &up = server.upload();
+    esp_task_wdt_reset();  // a full upload runs inside one handleClient() call
     if (up.status == UPLOAD_FILE_START) Update.begin(UPDATE_SIZE_UNKNOWN);
     else if (up.status == UPLOAD_FILE_WRITE) Update.write(up.buf, up.currentSize);
     else if (up.status == UPLOAD_FILE_END) Update.end(true);
@@ -434,7 +456,7 @@ void rejoinWifi() {
 // Top-right dot: green = ok, yellow = connected but no traffic, red = offline.
 void checkWifi() {
   static bool connected = false, mdnsStarted = false;
-  static int failedChecks = 0, rejoins = 0;
+  static int failedChecks = 0, rejoins = 0, stalledRejoins = 0, offlineRetries = 0;
   static unsigned long lostSince = 0, lastCheck = 0;
   bool now = WiFi.status() == WL_CONNECTED;
 
@@ -454,12 +476,18 @@ void checkWifi() {
     infoText = "WiFi lost, reason " + String(disconnectReason);
     infoUntil = millis() + 20000;
   } else if (!now && millis() - lostSince > 30000) {
+    // Still offline after many tries: a reboot is the reliable way back
+    if (++offlineRetries > 10) ESP.restart();
     lostSince = millis();
     rejoinWifi();
   } else if (now && millis() - lastCheck > 15000) {
     lastCheck = millis();
-    failedChecks = gatewayReachable() ? 0 : failedChecks + 1;
+    bool ok = gatewayReachable();
+    failedChecks = ok ? 0 : failedChecks + 1;
+    if (ok) offlineRetries = stalledRejoins = 0;
     if (failedChecks >= 3) {
+      // Rejoining didn't bring traffic back (e.g. heap exhausted): reboot
+      if (++stalledRejoins > 3) ESP.restart();
       failedChecks = 0;
       rejoins++;
       infoText = "No traffic, rejoin #" + String(rejoins);
@@ -716,12 +744,21 @@ void parseSymbols() {
   while (start <= (int)tickerSymbols.length() && quoteCount < MAX_QUOTES) {
     int end = tickerSymbols.indexOf(',', start);
     if (end < 0) end = tickerSymbols.length();
-    String sym = tickerSymbols.substring(start, end);
+    // "SYMBOL" or "SYMBOL:Label", e.g. "^GSPC:S&P500"
+    String sym = tickerSymbols.substring(start, end), label;
+    int colon = sym.indexOf(':');
+    if (colon >= 0) {
+      label = sym.substring(colon + 1);
+      sym = sym.substring(0, colon);
+    }
     sym.trim();
     sym.toUpperCase();
+    label.trim();
+    if (label.length() == 0) label = sym;
     if (sym.length() > 0 && sym.length() < sizeof(quotes[0].sym)) {
       Quote &q = quotes[quoteCount++];
       strcpy(q.sym, sym.c_str());
+      strlcpy(q.label, label.c_str(), sizeof(q.label));
       q.valid = false;
     }
     start = end + 1;
@@ -751,6 +788,7 @@ void fetchQuotes() {
     if (more) strcpy(sym, quotes[i].sym);
     xSemaphoreGive(quotesLock);
     if (!more) break;
+    esp_task_wdt_reset();
 
     String path = sym;
     path.replace("^", "%5E");  // index symbols like ^GSPC
@@ -781,87 +819,145 @@ void fetchQuotes() {
   quotesFetchedAt = millis();
 }
 
-// Runs in the loop task: a separate task's 8 KB stack left too little heap for TLS
+// Runs in the loop task: a separate task's 8 KB stack left too little heap for TLS.
+// mDNS is paused meanwhile too: the prebuilt mbedTLS uses two fixed 16 KB buffers and
+// keeps the peer certificate, which took free heap down to 2 KB.
 void maybeFetchQuotes() {
   if (quotesFetching || wifiState != 2) return;
   if (quotesFetchedAt && millis() - quotesFetchedAt < QUOTE_REFRESH_MS) return;
+  // TLS needs two 16 KB buffers in one piece each; with less, skip this round
+  // rather than starve WiFi
+  if (ESP.getMaxAllocHeap() < 36 * 1024 || ESP.getFreeHeap() < 50 * 1024) {
+    quotesFetchedAt = millis();
+    return;
+  }
   quotesFetching = true;
+  MDNS.end();
   fetchQuotes();
+  MDNS.begin(HOSTNAME);
+  MDNS.addService("http", "tcp", 80);
   quotesFetching = false;
 }
 
-// "AAPL 347.10" in 2x font over "\x1E+3.19 +0.93%" (up/down arrow from CP437) in 1x font.
-// Returns the item width in 2x character cells, including the gap to the next item.
-int formatQuote(const Quote &q, char *big, char *small) {
+// "AAPL 347.10" over "\x1E+3.19 +0.93%" (up/down arrow from CP437)
+void formatQuote(const Quote &q, char *line1, char *line2) {
   if (!q.valid) {
-    snprintf(big, 24, "%s ...", q.sym);
-    small[0] = 0;
+    snprintf(line1, 24, "%s ...", q.label);
+    line2[0] = 0;
   } else {
     float change = q.price - q.price / (1 + q.changePct / 100);
-    snprintf(big, 24, q.price < 1000 ? "%s %.2f" : "%s %.0f", q.sym, q.price);
-    snprintf(small, 24, "%c%+.2f %+.2f%%", q.changePct >= 0 ? 0x1E : 0x1F, change, q.changePct);
+    snprintf(line1, 24, q.price < 1000 ? "%s %.2f" : "%s %.0f", q.label, q.price);
+    snprintf(line2, 24, "%c%+.2f %+.2f%%", q.changePct >= 0 ? 0x1E : 0x1F, change, q.changePct);
   }
-  return max(strlen(big), (strlen(small) + 1) / 2) + 2;
 }
 
-// One half of the panel: every other quote (first = 0 top, 1 bottom), scrolled by offset px.
-// Every character cell is drawn with a black background, so nothing needs clearing.
-void drawTickerHalf(int y0, int first, int offset) {
+// Item width in px, including the gap to the next item. Widths are whole character
+// cells so every pixel of the row gets painted by some cell (no clearing, no flicker).
+int quoteWidth(const Quote &q, bool big) {
+  char line1[24], line2[24];
+  formatQuote(q, line1, line2);
+  int l1 = strlen(line1), l2 = strlen(line2);
+  if (big) return (max(l1, (l2 + 1) / 2) + 2 + (q.logo ? 2 : 0)) * 12;
+  return (max(l1, l2) + 2 + (q.logo ? 3 : 0)) * 6;
+}
+
+// One scrolling row of every step-th quote starting at first, scrolled by offset px.
+// Big: line 1 in 2x font (16px) over line 2 in 1x font, 28px tall.
+// Compact: both lines in 1x font next to the 16x16 logo, 16px tall.
+void drawTickerRow(int y, bool big, int first, int step, int offset) {
   Quote items[MAX_QUOTES];
   int n = 0;
   xSemaphoreTake(quotesLock, portMAX_DELAY);
-  for (int i = first; i < quoteCount; i += 2) items[n++] = quotes[i];
-  if (n == 0) {  // a single symbol: show it on both halves
+  for (int i = first; i < quoteCount; i += step) items[n++] = quotes[i];
+  if (n == 0) {  // fewer symbols than rows: repeat them all
     for (int i = 0; i < quoteCount; i++) items[n++] = quotes[i];
   }
   xSemaphoreGive(quotesLock);
   if (n == 0) return;
 
-  char big[24], small[24];
   int total = 0;
-  for (int i = 0; i < n; i++) total += (formatQuote(items[i], big, small) + (items[i].logo ? 2 : 0)) * 12;
+  for (int i = 0; i < n; i++) total += quoteWidth(items[i], big);
   int x = -(((offset % total) + total) % total);
 
-  uint16_t black = 0, symColor = display->color565(255, 200, 0), white = display->color565(255, 255, 255);
+  uint16_t black = 0, labelColor = display->color565(255, 200, 0), white = display->color565(255, 255, 255);
+  int cw = big ? 12 : 6;               // line 1 cell width
+  int logoPx = big ? 24 : 18;          // logo + margins, in whole cells
+  int logoX = big ? 2 : 0, logoY = big ? y + 4 : y;
+  int line1Y = big ? y + 4 : y, line2Y = big ? y + 22 : y + 8;
+  char line1[24], line2[24];
+
   for (int i = 0; x < PANEL_W; i = (i + 1) % n) {
-    int cells = formatQuote(items[i], big, small);
-    int symLen = strlen(items[i].sym), bigLen = strlen(big), smallLen = strlen(small);
-    uint16_t changeColor = !items[i].valid ? display->color565(100, 100, 100)
-                           : items[i].changePct >= 0 ? display->color565(0, 255, 0)
-                                                     : display->color565(255, 0, 0);
-    // The logo takes two 2x cells: 2px margin, 16px logo, 6px gap before the symbol
-    int logoCells = items[i].logo ? 2 : 0;
-    if (logoCells && x > -24 && x < PANEL_W) {
-      display->fillRect(x, y0 + 4, 2, 16, black);
-      display->fillRect(x + 18, y0 + 4, 6, 16, black);
-      display->drawRGBBitmap(x + 2, y0 + 4, items[i].logo, LOGO_SIZE, LOGO_SIZE);
+    const Quote &q = items[i];
+    int width = quoteWidth(q, big);
+    formatQuote(q, line1, line2);
+    int labelLen = strlen(q.label), l1 = strlen(line1), l2 = strlen(line2);
+    uint16_t changeColor = !q.valid ? display->color565(100, 100, 100)
+                           : q.changePct >= 0 ? display->color565(0, 255, 0)
+                                              : display->color565(255, 0, 0);
+    int lp = q.logo ? logoPx : 0;
+    if (lp && x > -lp && x < PANEL_W) {
+      if (logoX) display->fillRect(x, logoY, logoX, LOGO_SIZE, black);
+      display->fillRect(x + logoX + LOGO_SIZE, logoY, lp - logoX - LOGO_SIZE, LOGO_SIZE, black);
+      display->drawRGBBitmap(x + logoX, logoY, q.logo, LOGO_SIZE, LOGO_SIZE);
     }
-    int tx = x + logoCells * 12;
-    for (int c = 0; c < cells; c++) {
-      int cx = tx + c * 12;
-      if (cx <= -12 || cx >= PANEL_W) continue;
-      display->drawChar(cx, y0 + 4, c < bigLen ? big[c] : ' ', c < symLen ? symColor : white, black, 2);
+    for (int c = 0; c * cw < width - lp; c++) {
+      int cx = x + lp + c * cw;
+      if (cx <= -cw || cx >= PANEL_W) continue;
+      display->drawChar(cx, line1Y, c < l1 ? line1[c] : ' ', c < labelLen ? labelColor : white, black, big ? 2 : 1);
     }
-    // The change line starts under the symbol, so it's padded with blanks under the logo
-    for (int c = 0; c < (cells + logoCells) * 2; c++) {
-      int cx = x + c * 6, sc = c - logoCells * 2;
+    // Big: line 2 runs under the logo too (padded with blanks), compact: next to it
+    int l2Start = big ? 0 : lp;
+    for (int c = 0; c * 6 < width - l2Start; c++) {
+      int cx = x + l2Start + c * 6, sc = big ? c - lp / 6 : c;
       if (cx <= -6 || cx >= PANEL_W) continue;
-      display->drawChar(cx, y0 + 22, sc >= 0 && sc < smallLen ? small[sc] : ' ', changeColor, black, 1);
+      display->drawChar(cx, line2Y, sc >= 0 && sc < l2 ? line2[sc] : ' ', changeColor, black, 1);
     }
-    x += (cells + logoCells) * 12;
+    x += width;
   }
 }
 
-void drawTicker() {
+void drawTicker(const struct tm *t) {
   static unsigned long lastStep = 0;
-  static int offset = 0;
+  static int offset = 0, lastMin = -1;
   maybeFetchQuotes();
-  if (forceRedraw) display->drawFastHLine(0, 31, PANEL_W, display->color565(40, 40, 40));
+  uint16_t divider = display->color565(40, 40, 40);
+  if (forceRedraw) {
+    if (tickerLayout == TICKER_BIG) {
+      display->drawFastHLine(0, 31, PANEL_W, divider);
+    } else {
+      display->drawFastHLine(0, 21, PANEL_W, divider);
+      display->drawFastHLine(0, 42, PANEL_W, divider);
+    }
+  }
+  if (tickerLayout == TICKER_CLOCK && (t->tm_min != lastMin || forceRedraw)) {
+    lastMin = t->tm_min;
+    char buf[8];
+    snprintf(buf, sizeof(buf), "%02d:%02d", t->tm_hour, t->tm_min);
+    display->setTextSize(2);
+    display->setTextColor(display->color565(0, 200, 255), 0);
+    display->setCursor(3, 24);
+    display->print(buf);
+  }
   if (millis() - lastStep < 30 && !forceRedraw) return;
   lastStep = millis();
   offset++;
-  drawTickerHalf(0, 0, offset);
-  drawTickerHalf(32, 1, tickerOpposite ? -offset : offset);
+  // Odd rows go the other way when the "other way" option is on
+  auto dir = [](int row) { return tickerOpposite && row % 2 ? -1 : 1; };
+  switch (tickerLayout) {
+    case TICKER_BIG:
+      drawTickerRow(0, true, 0, 2, offset);
+      drawTickerRow(32, true, 1, 2, offset * dir(1));
+      break;
+    case TICKER_COMPACT:
+      drawTickerRow(3, false, 0, 3, offset);
+      drawTickerRow(24, false, 1, 3, offset * dir(1));
+      drawTickerRow(45, false, 2, 3, offset);
+      break;
+    case TICKER_CLOCK:
+      drawTickerRow(3, false, 0, 2, offset);
+      drawTickerRow(45, false, 1, 2, offset * dir(1));
+      break;
+  }
 }
 
 void setScreen(bool on) {
@@ -936,8 +1032,9 @@ void setup() {
   quotesLock = xSemaphoreCreateMutex();
   logoPartition = esp_partition_find_first(ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_SPIFFS, nullptr);
   mapLogos();
-  tickerSymbols = prefs.getString("tickers", "SPY,QQQ,AAPL,MSFT,NVDA,GOOGL,AMZN,META,TSLA,BTC-USD");
+  tickerSymbols = prefs.getString("tickers", DEFAULT_TICKERS);
   tickerOpposite = prefs.getBool("topp", true);
+  tickerLayout = min<int>(prefs.getUChar("tlayout", TICKER_CLOCK), TICKER_LAYOUT_COUNT - 1);
   parseSymbols();
 
   // Undo what enterDeepSleep() set up, in case we just woke from it
@@ -981,9 +1078,16 @@ void setup() {
   configTzTime(TIMEZONE, "pool.ntp.org", "time.google.com");
   setupWeb();
   heapWifi = ESP.getFreeHeap() / 1024;
+
+  // Reboot if loop() ever hangs. 60 s, not the default 5 s: quote fetches and OTA
+  // uploads block the loop for a while (they feed the watchdog as they go).
+  esp_task_wdt_config_t wdt = {.timeout_ms = 60000, .idle_core_mask = 0, .trigger_panic = true};
+  esp_task_wdt_reconfigure(&wdt);
+  esp_task_wdt_add(nullptr);
 }
 
 void loop() {
+  esp_task_wdt_reset();
   server.handleClient();
   checkWifi();
   checkButton();
@@ -1007,7 +1111,7 @@ void loop() {
       drawPlasma();
       break;
     case MODE_TICKER:
-      drawTicker();
+      drawTicker(t);
       break;
   }
   forceRedraw = false;
