@@ -12,7 +12,10 @@
 #include <driver/gpio.h>
 #include <driver/rtc_io.h>
 #include <esp_sleep.h>
+#include <esp_partition.h>
 #include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
 #include <WebServer.h>
 #include <ESPmDNS.h>
 #include <Update.h>
@@ -61,10 +64,11 @@ uint32_t msgColor;  // 0xRRGGBB
 uint8_t brightness;
 uint8_t nightStart, nightEnd, nightBrightness;  // hours; start == end disables
 
-enum Mode { MODE_CLOCK, MODE_LIFE, MODE_PLASMA, MODE_COUNT };
-const char *modeNames[] = {"Clock", "Game of Life", "Plasma"};
+enum Mode { MODE_CLOCK, MODE_LIFE, MODE_PLASMA, MODE_TICKER, MODE_COUNT };
+const char *modeNames[] = {"Clock", "Game of Life", "Plasma", "Ticker"};
 uint8_t mode;
 bool forceRedraw = true;  // set on mode change so the clock redraws everything
+bool screenOn = true;     // off = panel blank but WiFi stays up (unlike deep sleep)
 int wifiState = 0;        // 0 = offline, 1 = connected but no traffic, 2 = ok
 
 String infoText;          // shown instead of the message for a while (e.g. IP)
@@ -120,6 +124,32 @@ const LifeScene lifeScenes[] = {
 };
 #define LIFE_SCENE_COUNT (sizeof(lifeScenes) / sizeof(lifeScenes[0]))
 #define LIFE_CYCLE LIFE_SCENE_COUNT  // pseudo-scene: next scene each restart
+
+// Stock ticker: quotes from Yahoo's chart API over HTTPS (~45 KB RAM for TLS).
+#define MAX_QUOTES 12
+#define QUOTE_REFRESH_MS (5 * 60 * 1000UL)
+struct Quote { char sym[12]; float price, changePct; bool valid; const uint16_t *logo; };
+
+// Ticker logos: 16x16 RGB565, uploaded by tools/logos.py into the unused "spiffs"
+// flash partition, one sector per logo so replacing one is a single erase.
+// The partition is memory-mapped, so drawing reads flash directly and costs no RAM.
+#define LOGO_SIZE 16
+#define LOGO_SLOTS 64
+#define LOGO_SLOT_BYTES 4096
+struct LogoSlot { char sym[12]; uint16_t pixels[LOGO_SIZE * LOGO_SIZE]; };
+const esp_partition_t *logoPartition;
+const uint8_t *logoMap;
+esp_partition_mmap_handle_t logoMapHandle;
+uint16_t *logoUpload;  // staging buffer, only allocated during an upload
+size_t logoUploadLen;
+Quote quotes[MAX_QUOTES];
+int quoteCount = 0;
+SemaphoreHandle_t quotesLock;
+String tickerSymbols;
+bool tickerOpposite;  // bottom half scrolls the other way
+volatile bool quotesFetching = false;
+unsigned long quotesFetchedAt = 0;  // 0 = fetch as soon as possible
+volatile int lastQuoteHttpCode = 0;
 
 uint8_t bcd2dec(uint8_t v) { return (v >> 4) * 10 + (v & 0x0F); }
 uint8_t dec2bcd(uint8_t v) { return ((v / 10) << 4) | (v % 10); }
@@ -188,7 +218,7 @@ bool isNight(int hour) {
 
 void applyBrightness(int hour) {
   static int current = -1;
-  int target = isNight(hour) ? nightBrightness : brightness;
+  int target = !screenOn ? 0 : isNight(hour) ? nightBrightness : brightness;
   if (target != current) {
     current = target;
     display->setBrightness8(target);
@@ -211,9 +241,9 @@ String htmlEscape(const String &s) {
 void handleRoot() {
   char color[8];
   snprintf(color, sizeof(color), "#%06X", (unsigned)msgColor);
-  String modes = "<form action=/mode><p>";
+  String modes = "<form action=/mode>";
   for (int i = 0; i < MODE_COUNT; i++) {
-    modes += String("<button name=m value=") + i + (i == mode ? " style='font-weight:bold'>" : ">") +
+    modes += String("<button name=m value=") + i + (i == mode ? " class=on>" : ">") +
              modeNames[i] + "</button> ";
   }
   modes += "</form>";
@@ -223,18 +253,40 @@ void handleRoot() {
                     (i == LIFE_CYCLE ? "Cycle through all" : lifeScenes[i].name) + "</option>";
   }
   String page =
-    "<!doctype html><meta name=viewport content='width=device-width'>"
-    "<title>LED clock</title><body style='font-family:sans-serif;max-width:400px;margin:2em auto'>"
-    "<h2>LED clock</h2>" + modes + "<form action=/set>"
-    "<p>Message<br><input name=msg maxlength=100 style='width:100%' value=\"" + htmlEscape(message) + "\">"
-    "<p>Color <input type=color name=color value='" + color + "'>"
-    "<p>Brightness<br><input type=range name=bright min=1 max=255 style='width:100%' value=" + brightness + ">"
-    "<p>Night from <input type=number name=nstart min=0 max=23 value=" + nightStart + "> to "
-    "<input type=number name=nend min=0 max=23 value=" + nightEnd + "> h (same hour = off)"
-    "<p>Night brightness<br><input type=range name=nbright min=1 max=255 style='width:100%' value=" + nightBrightness + ">"
-    "<h3>Game of Life</h3><p>Scene <select name=scene>" + sceneOptions + "</select>"
-    "<p>Speed (ms per generation, left = faster)<br>"
-    "<input type=range name=lspeed min=20 max=1000 step=10 style='width:100%' value=" + lifeSpeed + ">"
+    "<!doctype html><meta name=viewport content='width=device-width,initial-scale=1'>"
+    "<title>LED clock</title><style>"
+    // border-box keeps width:100% inputs inside the page on narrow phone screens
+    "*{box-sizing:border-box}"
+    "body{font-family:sans-serif;max-width:420px;margin:0 auto;padding:1em}"
+    "input,select,button{font-size:1em;max-width:100%}"
+    "input[type=range],input[name=msg],select{width:100%}"
+    "input[type=number]{width:4.5em}"
+    "button{padding:.5em .8em;margin:.15em 0}"
+    ".on{font-weight:bold;outline:2px solid}"
+    "label{display:block;margin-top:1em}"
+    "</style><h2>LED clock</h2>" + modes +
+    "<form action=/power>Screen "
+    "<button name=on value=1" + (screenOn ? " class=on" : "") + ">On</button> "
+    "<button name=on value=0" + (!screenOn ? " class=on" : "") + ">Off</button> "
+    "<button formaction=/sleep onclick=\"return confirm('Deep sleep? Only the button on the board can wake it.')\">"
+    "Deep sleep</button></form>"
+    "<form action=/set>"
+    "<label>Message<input name=msg maxlength=100 value=\"" + htmlEscape(message) + "\"></label>"
+    "<label>Color <input type=color name=color value='" + color + "'></label>"
+    "<label>Brightness<input type=range name=bright min=1 max=255 value=" + brightness + "></label>"
+    "<label>Night from <input type=number name=nstart min=0 max=23 value=" + nightStart + "> to "
+    "<input type=number name=nend min=0 max=23 value=" + nightEnd + "> h<br><small>same hour = off</small></label>"
+    "<label>Night brightness<input type=range name=nbright min=1 max=255 value=" + nightBrightness + "></label>"
+    "<h3>Game of Life</h3>"
+    "<label>Scene<select name=scene>" + sceneOptions + "</select></label>"
+    "<label>Speed <small>(left = faster)</small>"
+    "<input type=range name=lspeed min=20 max=1000 step=10 value=" + lifeSpeed + "></label>"
+    "<h3>Ticker</h3>"
+    "<label>Symbols <small>(comma separated, up to 12, Yahoo style: AAPL, ^GSPC, BTC-USD)</small>"
+    "<input name=tickers maxlength=150 style='width:100%' value=\"" + htmlEscape(tickerSymbols) + "\"></label>"
+    "<label>Bottom half scrolls<select name=topp>"
+    "<option value=1" + (tickerOpposite ? " selected" : "") + ">the other way</option>"
+    "<option value=0" + (!tickerOpposite ? " selected" : "") + ">the same way</option></select></label>"
     "<p><button>Save</button></form>"
     "<p><a href=/update>Firmware update</a>";
   server.send(200, "text/html", page);
@@ -253,6 +305,13 @@ void handleSet() {
     if (scene != lifeScene) lifeReseed = true;
     lifeScene = scene;
   }
+  if (server.hasArg("topp")) tickerOpposite = server.arg("topp") == "1";
+  if (server.hasArg("tickers") && server.arg("tickers") != tickerSymbols) {
+    tickerSymbols = server.arg("tickers");
+    parseSymbols();
+  }
+  prefs.putString("tickers", tickerSymbols);
+  prefs.putBool("topp", tickerOpposite);
   prefs.putUShort("lspeed", lifeSpeed);
   prefs.putUChar("scene", lifeScene);
   prefs.putString("msg", message);
@@ -272,6 +331,53 @@ void setupWeb() {
     if (server.hasArg("m")) setMode(server.arg("m").toInt());
     server.sendHeader("Location", "/");
     server.send(303);
+  });
+  server.on("/tickers", []() { server.send(200, "text/plain", tickerSymbols); });
+  // Raw 16x16 RGB565 (little endian) logo for ?sym=, as a multipart file upload
+  server.on("/logo", HTTP_POST, []() {
+    if (!server.authenticate("admin", OTA_PASSWORD)) return server.requestAuthentication();
+    bool ok = logoUpload && logoUploadLen == sizeof(LogoSlot::pixels) && server.hasArg("sym") &&
+              saveLogo(server.arg("sym"), logoUpload);
+    free(logoUpload);
+    logoUpload = nullptr;
+    server.send(ok ? 200 : 400, "text/plain", ok ? "OK\n" : "Bad logo\n");
+  }, []() {
+    if (!server.authenticate("admin", OTA_PASSWORD)) return;
+    HTTPUpload &up = server.upload();
+    if (up.status == UPLOAD_FILE_START) {
+      free(logoUpload);
+      logoUpload = (uint16_t *)malloc(sizeof(LogoSlot::pixels));
+      logoUploadLen = 0;
+    } else if (up.status == UPLOAD_FILE_WRITE && logoUpload) {
+      if (logoUploadLen + up.currentSize <= sizeof(LogoSlot::pixels)) {
+        memcpy((uint8_t *)logoUpload + logoUploadLen, up.buf, up.currentSize);
+      }
+      logoUploadLen += up.currentSize;  // oversized uploads fail the length check
+    }
+  });
+  server.on("/status", []() {
+    String s = String("heap ") + ESP.getFreeHeap() + " min " + ESP.getMinFreeHeap() +
+               " largest " + ESP.getMaxAllocHeap() + "\nquotes fetching " + quotesFetching +
+               " last http " + lastQuoteHttpCode + " fetched " +
+               (quotesFetchedAt ? String((millis() - quotesFetchedAt) / 1000) + "s ago" : String("never")) + "\n";
+    xSemaphoreTake(quotesLock, portMAX_DELAY);
+    for (int i = 0; i < quoteCount; i++) {
+      s += String(quotes[i].sym) + " " + (quotes[i].valid ? String(quotes[i].price, 2) + " " + String(quotes[i].changePct, 2) + "%" : String("-")) + "\n";
+    }
+    xSemaphoreGive(quotesLock);
+    server.send(200, "text/plain", s);
+  });
+  server.on("/power", []() {
+    if (server.hasArg("on")) setScreen(server.arg("on") == "1");
+    server.sendHeader("Location", "/");
+    server.send(303);
+  });
+  server.on("/sleep", []() {
+    server.send(200, "text/html",
+      "<meta name=viewport content='width=device-width,initial-scale=1'>"
+      "<p style='font-family:sans-serif'>Sleeping. Press the button on the board to wake it.");
+    delay(200);  // let the response go out before WiFi shuts down
+    enterDeepSleep();
   });
   server.on("/update", HTTP_GET, []() {
     if (!server.authenticate("admin", OTA_PASSWORD)) return server.requestAuthentication();
@@ -531,6 +637,227 @@ void setMode(uint8_t m) {
   lifeReseed = true;
 }
 
+const LogoSlot *logoSlot(int i) { return (const LogoSlot *)(logoMap + i * LOGO_SLOT_BYTES); }
+
+const uint16_t *findLogo(const char *sym) {
+  if (!logoMap) return nullptr;
+  for (int i = 0; i < LOGO_SLOTS; i++) {
+    if (!strncmp(logoSlot(i)->sym, sym, sizeof(LogoSlot::sym))) return logoSlot(i)->pixels;
+  }
+  return nullptr;
+}
+
+// (Re)map after writing, so reads can't come from stale cached flash
+void mapLogos() {
+  if (logoMap) esp_partition_munmap(logoMapHandle);
+  logoMap = nullptr;
+  const void *p;
+  if (logoPartition && esp_partition_mmap(logoPartition, 0, LOGO_SLOTS * LOGO_SLOT_BYTES,
+                                          ESP_PARTITION_MMAP_DATA, &p, &logoMapHandle) == ESP_OK) {
+    logoMap = (const uint8_t *)p;
+  }
+}
+
+// Call with quotesLock held
+void refreshQuoteLogos() {
+  for (int i = 0; i < quoteCount; i++) quotes[i].logo = findLogo(quotes[i].sym);
+}
+
+bool saveLogo(String sym, const uint16_t *pixels) {
+  sym.trim();
+  sym.toUpperCase();
+  if (!logoMap || sym.length() == 0 || sym.length() >= sizeof(LogoSlot::sym)) return false;
+  int slot = -1;
+  for (int i = 0; i < LOGO_SLOTS && slot < 0; i++) {
+    if (!strncmp(logoSlot(i)->sym, sym.c_str(), sizeof(LogoSlot::sym))) slot = i;
+  }
+  // Free = no valid name: erased (0xFF) or leftovers from the stock Huidu firmware
+  for (int i = 0; i < LOGO_SLOTS && slot < 0; i++) {
+    const char *name = logoSlot(i)->sym;
+    int len = strnlen(name, sizeof(LogoSlot::sym));
+    bool valid = len > 0 && len < (int)sizeof(LogoSlot::sym);
+    for (int c = 0; c < len && valid; c++) valid = isprint((unsigned char)name[c]);
+    if (!valid) slot = i;
+  }
+  if (slot < 0) slot = esp_random() % LOGO_SLOTS;
+
+  LogoSlot *s = (LogoSlot *)calloc(1, sizeof(LogoSlot));
+  if (!s) return false;
+  strcpy(s->sym, sym.c_str());
+  memcpy(s->pixels, pixels, sizeof(s->pixels));
+  bool ok = esp_partition_erase_range(logoPartition, slot * LOGO_SLOT_BYTES, LOGO_SLOT_BYTES) == ESP_OK &&
+            esp_partition_write(logoPartition, slot * LOGO_SLOT_BYTES, s, sizeof(LogoSlot)) == ESP_OK;
+  free(s);
+
+  xSemaphoreTake(quotesLock, portMAX_DELAY);
+  mapLogos();
+  refreshQuoteLogos();
+  xSemaphoreGive(quotesLock);
+  return ok;
+}
+
+// Comma-separated list -> quote slots (prices cleared until the next fetch)
+void parseSymbols() {
+  xSemaphoreTake(quotesLock, portMAX_DELAY);
+  quoteCount = 0;
+  int start = 0;
+  while (start <= (int)tickerSymbols.length() && quoteCount < MAX_QUOTES) {
+    int end = tickerSymbols.indexOf(',', start);
+    if (end < 0) end = tickerSymbols.length();
+    String sym = tickerSymbols.substring(start, end);
+    sym.trim();
+    sym.toUpperCase();
+    if (sym.length() > 0 && sym.length() < sizeof(quotes[0].sym)) {
+      Quote &q = quotes[quoteCount++];
+      strcpy(q.sym, sym.c_str());
+      q.valid = false;
+    }
+    start = end + 1;
+  }
+  refreshQuoteLogos();
+  xSemaphoreGive(quotesLock);
+  quotesFetchedAt = 0;
+}
+
+bool jsonNumber(const String &body, const char *key, float &out) {
+  int i = body.indexOf(key);
+  if (i < 0) return false;
+  out = strtof(body.c_str() + i + strlen(key), nullptr);
+  return true;
+}
+
+void fetchQuotes() {
+  WiFiClientSecure client;
+  client.setInsecure();  // no CA bundle in RAM; it's public quote data
+  HTTPClient http;
+  http.setReuse(true);  // one TLS handshake for all symbols
+  http.setUserAgent("Mozilla/5.0");  // Yahoo rejects requests without one
+  for (int i = 0;; i++) {
+    char sym[sizeof(quotes[0].sym)];
+    xSemaphoreTake(quotesLock, portMAX_DELAY);
+    bool more = i < quoteCount;
+    if (more) strcpy(sym, quotes[i].sym);
+    xSemaphoreGive(quotesLock);
+    if (!more) break;
+
+    String path = sym;
+    path.replace("^", "%5E");  // index symbols like ^GSPC
+    float price, pct;
+    bool ok = false;
+    if (http.begin(client, "https://query1.finance.yahoo.com/v8/finance/chart/" + path + "?range=1d&interval=1d")) {
+      lastQuoteHttpCode = http.GET();
+      if (lastQuoteHttpCode == 200) {
+        String body = http.getString();
+        float prev;
+        ok = jsonNumber(body, "\"regularMarketPrice\":", price);
+        if (ok && !jsonNumber(body, "\"regularMarketChangePercent\":", pct)) {
+          pct = jsonNumber(body, "\"chartPreviousClose\":", prev) && prev ? (price - prev) / prev * 100 : 0;
+        }
+      }
+      http.end();
+    }
+
+    xSemaphoreTake(quotesLock, portMAX_DELAY);
+    // The list may have been edited from the web page meanwhile
+    if (ok && i < quoteCount && !strcmp(quotes[i].sym, sym)) {
+      quotes[i].price = price;
+      quotes[i].changePct = pct;
+      quotes[i].valid = true;
+    }
+    xSemaphoreGive(quotesLock);
+  }
+  quotesFetchedAt = millis();
+}
+
+// Runs in the loop task: a separate task's 8 KB stack left too little heap for TLS
+void maybeFetchQuotes() {
+  if (quotesFetching || wifiState != 2) return;
+  if (quotesFetchedAt && millis() - quotesFetchedAt < QUOTE_REFRESH_MS) return;
+  quotesFetching = true;
+  fetchQuotes();
+  quotesFetching = false;
+}
+
+// "AAPL 347.10" in 2x font over "\x1E+3.19 +0.93%" (up/down arrow from CP437) in 1x font.
+// Returns the item width in 2x character cells, including the gap to the next item.
+int formatQuote(const Quote &q, char *big, char *small) {
+  if (!q.valid) {
+    snprintf(big, 24, "%s ...", q.sym);
+    small[0] = 0;
+  } else {
+    float change = q.price - q.price / (1 + q.changePct / 100);
+    snprintf(big, 24, q.price < 1000 ? "%s %.2f" : "%s %.0f", q.sym, q.price);
+    snprintf(small, 24, "%c%+.2f %+.2f%%", q.changePct >= 0 ? 0x1E : 0x1F, change, q.changePct);
+  }
+  return max(strlen(big), (strlen(small) + 1) / 2) + 2;
+}
+
+// One half of the panel: every other quote (first = 0 top, 1 bottom), scrolled by offset px.
+// Every character cell is drawn with a black background, so nothing needs clearing.
+void drawTickerHalf(int y0, int first, int offset) {
+  Quote items[MAX_QUOTES];
+  int n = 0;
+  xSemaphoreTake(quotesLock, portMAX_DELAY);
+  for (int i = first; i < quoteCount; i += 2) items[n++] = quotes[i];
+  if (n == 0) {  // a single symbol: show it on both halves
+    for (int i = 0; i < quoteCount; i++) items[n++] = quotes[i];
+  }
+  xSemaphoreGive(quotesLock);
+  if (n == 0) return;
+
+  char big[24], small[24];
+  int total = 0;
+  for (int i = 0; i < n; i++) total += (formatQuote(items[i], big, small) + (items[i].logo ? 2 : 0)) * 12;
+  int x = -(((offset % total) + total) % total);
+
+  uint16_t black = 0, symColor = display->color565(255, 200, 0), white = display->color565(255, 255, 255);
+  for (int i = 0; x < PANEL_W; i = (i + 1) % n) {
+    int cells = formatQuote(items[i], big, small);
+    int symLen = strlen(items[i].sym), bigLen = strlen(big), smallLen = strlen(small);
+    uint16_t changeColor = !items[i].valid ? display->color565(100, 100, 100)
+                           : items[i].changePct >= 0 ? display->color565(0, 255, 0)
+                                                     : display->color565(255, 0, 0);
+    // The logo takes two 2x cells: 2px margin, 16px logo, 6px gap before the symbol
+    int logoCells = items[i].logo ? 2 : 0;
+    if (logoCells && x > -24 && x < PANEL_W) {
+      display->fillRect(x, y0 + 4, 2, 16, black);
+      display->fillRect(x + 18, y0 + 4, 6, 16, black);
+      display->drawRGBBitmap(x + 2, y0 + 4, items[i].logo, LOGO_SIZE, LOGO_SIZE);
+    }
+    int tx = x + logoCells * 12;
+    for (int c = 0; c < cells; c++) {
+      int cx = tx + c * 12;
+      if (cx <= -12 || cx >= PANEL_W) continue;
+      display->drawChar(cx, y0 + 4, c < bigLen ? big[c] : ' ', c < symLen ? symColor : white, black, 2);
+    }
+    // The change line starts under the symbol, so it's padded with blanks under the logo
+    for (int c = 0; c < (cells + logoCells) * 2; c++) {
+      int cx = x + c * 6, sc = c - logoCells * 2;
+      if (cx <= -6 || cx >= PANEL_W) continue;
+      display->drawChar(cx, y0 + 22, sc >= 0 && sc < smallLen ? small[sc] : ' ', changeColor, black, 1);
+    }
+    x += (cells + logoCells) * 12;
+  }
+}
+
+void drawTicker() {
+  static unsigned long lastStep = 0;
+  static int offset = 0;
+  maybeFetchQuotes();
+  if (forceRedraw) display->drawFastHLine(0, 31, PANEL_W, display->color565(40, 40, 40));
+  if (millis() - lastStep < 30 && !forceRedraw) return;
+  lastStep = millis();
+  offset++;
+  drawTickerHalf(0, 0, offset);
+  drawTickerHalf(32, 1, tickerOpposite ? -offset : offset);
+}
+
+void setScreen(bool on) {
+  screenOn = on;
+  display->clearScreen();
+  forceRedraw = true;
+}
+
 void enterDeepSleep() {
   display->clearScreen();
   delay(50);  // let a full black frame latch into the panel
@@ -553,7 +880,7 @@ void enterDeepSleep() {
   esp_deep_sleep_start();
 }
 
-// Short press (released before 2s) = next mode, hold 2s = deep sleep
+// Short press (released before 2s) = next mode (or screen on if off), hold 2s = deep sleep
 void checkButton() {
   // Starting from the current level ignores a press still held from waking up
   static bool raw = digitalRead(BUTTON_PIN) == LOW, stable = raw, armed = false;
@@ -570,7 +897,8 @@ void checkButton() {
       armed = true;
     } else if (armed) {
       armed = false;
-      setMode(mode + 1);
+      if (screenOn) setMode(mode + 1);
+      else setScreen(true);
     }
   }
   if (stable && armed && millis() - pressedAt > 2000) {
@@ -593,6 +921,12 @@ void setup() {
   mode = prefs.getUChar("mode", MODE_CLOCK) % MODE_COUNT;
   lifeSpeed = constrain(prefs.getUShort("lspeed", 100), 20, 1000);
   lifeScene = min<int>(prefs.getUChar("scene", 0), LIFE_CYCLE);
+  quotesLock = xSemaphoreCreateMutex();
+  logoPartition = esp_partition_find_first(ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_SPIFFS, nullptr);
+  mapLogos();
+  tickerSymbols = prefs.getString("tickers", "SPY,QQQ,AAPL,MSFT,NVDA,GOOGL,AMZN,META,TSLA,BTC-USD");
+  tickerOpposite = prefs.getBool("topp", true);
+  parseSymbols();
 
   // Undo what enterDeepSleep() set up, in case we just woke from it
   gpio_hold_dis((gpio_num_t)OE);
@@ -649,7 +983,7 @@ void loop() {
   time_t now = time(nullptr);
   struct tm *t = localtime(&now);
   applyBrightness(t->tm_hour);
-  switch (mode) {
+  switch (screenOn ? mode : MODE_COUNT) {
     case MODE_CLOCK:
       drawClock(t);
       drawMessage();
@@ -659,6 +993,9 @@ void loop() {
       break;
     case MODE_PLASMA:
       drawPlasma();
+      break;
+    case MODE_TICKER:
+      drawTicker();
       break;
   }
   forceRedraw = false;
