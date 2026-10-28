@@ -4,8 +4,13 @@ A WiFi clock for a 64x64 HUB75 LED panel driven by a **Huidu HD-WF1**, a cheap
 LED-sign controller card that happens to be an ESP32-S2. This replaces Huidu's
 stock firmware with an Arduino sketch.
 
-- Date, time and seconds; time comes from NTP and is kept in the on-board BM8563 RTC
-- A scrolling message, its color and the brightness, set from a web page at `http://ledclock.local`
+- Modes:
+  - **Clock**: date, time and seconds. Time comes from NTP and is kept in UTC in the on-board BM8563 RTC.
+  - **Game of Life**: random soup, or famous patterns (Gosper glider gun with eater, oscillators, spaceships, methuselahs), with adjustable speed
+  - **Plasma**
+- A web page at `http://ledclock.local` to pick the mode, the Life scene and speed, a scrolling message with its color, and the brightness
+- Night dimming between configurable hours
+- On-board button: short press for the next mode, hold 2 s for deep sleep, press again to wake
 - Firmware updates over WiFi
 
 Pinout from [mrfaptastic/HD-WF1-LED-MatrixPanel-DMA](https://github.com/mrfaptastic/HD-WF1-LED-MatrixPanel-DMA),
