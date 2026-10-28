@@ -8,6 +8,7 @@ stock firmware with an Arduino sketch.
   - **Clock**: date, time and seconds. Time comes from NTP and is kept in UTC in the on-board BM8563 RTC.
   - **Game of Life**: random soup, or famous patterns (Gosper glider gun with eater, oscillators, spaceships, methuselahs), with adjustable speed
   - **Plasma**
+  - **Ticker**: stock quotes from Yahoo scrolling across the top and bottom halves, with logos
 - A web page at `http://ledclock.local` to pick the mode, the Life scene and speed, a scrolling message with its color, and the brightness
 - Night dimming between configurable hours
 - On-board button: short press for the next mode, hold 2 s for deep sleep, press again to wake
@@ -63,4 +64,15 @@ joins WiFi.
 
 ```sh
 ./ota.sh            # or ./ota.sh <ip>
+```
+
+## Ticker logos
+
+The board has too little RAM to download and decode PNGs, so a PC script
+fetches the logos for the board's ticker symbols, shrinks them to 16x16 and
+uploads the raw pixels. Run it again after changing the symbols.
+
+```sh
+python3 tools/logos.py [host]                  # needs Pillow
+python3 tools/logos.py --preview preview.png   # just look at them first
 ```
