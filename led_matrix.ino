@@ -238,6 +238,14 @@ String htmlEscape(const String &s) {
   return out;
 }
 
+// esp_timer instead of millis(), which wraps after 49 days
+String uptimeText() {
+  uint32_t mins = esp_timer_get_time() / 60000000ULL;
+  if (mins < 60) return String(mins) + " min";
+  if (mins < 24 * 60) return String(mins / 60) + " h " + (mins % 60) + " min";
+  return String(mins / (24 * 60)) + " d " + (mins / 60 % 24) + " h";
+}
+
 void handleRoot() {
   char color[8];
   snprintf(color, sizeof(color), "#%06X", (unsigned)msgColor);
@@ -288,7 +296,11 @@ void handleRoot() {
     "<option value=1" + (tickerOpposite ? " selected" : "") + ">the other way</option>"
     "<option value=0" + (!tickerOpposite ? " selected" : "") + ">the same way</option></select></label>"
     "<p><button>Save</button></form>"
-    "<p><a href=/update>Firmware update</a>";
+    "<p><a href=/update>Firmware update</a>"
+    // "lowest" is the one to watch: at ~5 KB WiFi silently stopped passing traffic
+    "<p><small>Free RAM " + ESP.getFreeHeap() / 1024 + " KB &middot; lowest " +
+    ESP.getMinFreeHeap() / 1024 + " KB &middot; WiFi " + WiFi.RSSI() + " dBm &middot; up " + uptimeText() +
+    " &middot; <a href=/status>details</a></small>";
   server.send(200, "text/html", page);
 }
 
